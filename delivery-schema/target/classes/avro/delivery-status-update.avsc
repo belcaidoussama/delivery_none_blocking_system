@@ -1,0 +1,10 @@
+{
+    "type": "record",
+    "name": "DeliveryStatusUpdate",
+    "namespace": "com.system.delivery.schema",
+    "fields": [
+        { "name": "bookingId", "type": "long" },
+        { "name": "status", "type": "string" },
+        { "name": "timestamp", "type": "string" }
+    ]
+}
