@@ -39,10 +39,10 @@ This project is a **high-performance, event-driven delivery booking system** des
 - **Consumes booking status events**.
 - **Computes & aggregates real-time metrics**:
  - **Total bookings**(done)
- - **Bookings per status**
+ - **Bookings per status(done)**
  - **Average delivery time**(to do)
  - **Delayed deliveries**(to do)
-- Streams results to **Kafka topics** for Grafana dashboards.
+- Streams results to Prometheus.
 
 ---
 
@@ -65,10 +65,9 @@ This project is a **high-performance, event-driven delivery booking system** des
 ##  Real-Time Monitoring & Analytics
 1. **Kafka Streams computes real-time booking metrics.**
 2. **Prometheus tracks system health & API performance.**
-3. **Grafana visualizes:**
+3. **Prometheus visualizes:**
 - **Live status updates**
-- **Booking trends**
-- **Delayed vs. on-time deliveries**
+- **Live status updates per status (simple metrics)**
 ![img.png](img.png)
 - ![img_1.png](img_1.png)
 ---
