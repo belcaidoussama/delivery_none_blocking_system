@@ -1,16 +1,20 @@
 package com.system.delivery.service.Impl;
 
 import java.time.Instant;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import com.system.delivery.producer.DeliveryStatusProducerService;
 import com.system.delivery.schema.DeliveryStatusUpdate;
 import org.redisson.api.RLockReactive;
 import org.redisson.api.RQueueReactive;
 import org.redisson.api.RedissonReactiveClient;
+import org.redisson.client.codec.JsonCodec;
 import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.CachePut;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 
 import com.system.delivery.dto.DeliveryBookingDTO;
@@ -21,7 +25,7 @@ import com.system.delivery.repository.DeliverySlotRepository;
 import com.system.delivery.repository.DriverScheduleRepository;
 import com.system.delivery.service.DeliveryBookingService;
 
-import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.publisher.Flux;
@@ -39,14 +43,11 @@ public class DeliveryBookingServiceImpl implements DeliveryBookingService {
     private final RedissonReactiveClient redissonClient;
     private final DeliveryStatusProducerService kafkaProducerService;
 
-    private final ExecutorService virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
-    private RQueueReactive<DeliveryBooking> bookingQueue;
+    // Initialize bookingQueue directly
+    private final RQueueReactive<DeliveryBooking> bookingQueue =
+            redissonClient.getQueue("deliveryBookingQueue", new JsonCodec<>(DeliveryBooking.class));
 
-
-    @PostConstruct
-    private void init() {
-        this.bookingQueue = redissonClient.getQueue("bookingQueue");
-    }
+    // No longer need a virtual thread executor
 
     @Override
     @Cacheable(value = "bookings", key = "#id")
@@ -57,6 +58,8 @@ public class DeliveryBookingServiceImpl implements DeliveryBookingService {
                 .doOnError(error -> log.error("Error fetching booking", error));
     }
 
+    @Override
+    @CacheEvict(value = "bookings", allEntries = true)
     public Mono<Void> deleteDeliveryBooking(Long id) {
         log.info("Deleting booking with ID: {}", id);
         return bookingRepository.deleteById(id)
@@ -66,50 +69,62 @@ public class DeliveryBookingServiceImpl implements DeliveryBookingService {
 
     @Override
     @Cacheable(value = "bookings")
-    public Flux<DeliveryBooking> getAllDeliveryBookings() {
-        return bookingRepository.findAll();
+    public Mono<List<DeliveryBooking>> getAllDeliveryBookings() {
+        return bookingRepository.findAll()
+                .collectList()
+                .cache();
     }
-
 
     @Override
     @CacheEvict(value = "bookings", allEntries = true)
     public Mono<DeliveryBooking> createDeliveryBooking(DeliveryBookingDTO bookingDTO) {
         return bookingQueue.offer(bookingDTO.toEntity())
-                .then(processBookingQueue())
+                .flatMap(success -> {
+                    if (Boolean.TRUE.equals(success)) {
+                        return processBookingQueue();
+                    } else {
+                        return Mono.error(new IllegalStateException("Failed to enqueue booking"));
+                    }
+                })
                 .doOnSuccess(savedBooking -> log.info("Booking successfully created: {}", savedBooking))
                 .doOnError(error -> log.error(" Error creating booking", error));
     }
 
     private Mono<DeliveryBooking> processBookingQueue() {
-        return bookingQueue.poll()
+        return Mono.defer(() -> bookingQueue.poll()
                 .flatMap(booking -> slotRepository.findById(booking.getSlotId())
                         .flatMap(slot -> driverScheduleRepository.findByScheduleDateAndAvailable(booking.getDeliveryDate(), true)
                                 .flatMap(schedule -> {
-                                    RLockReactive lock = redissonClient.getLock("driver:" + schedule.getScheduleDate());
-                                    return lock.tryLock()
-                                            .flatMap(acquired -> {
+                                    RLockReactive lock = redissonClient.getLock("driver:" + schedule.getDeliveryDriverId() + ":" + schedule.getScheduleDate());
+                                    return Mono.usingWhen(
+                                            lock.tryLock(5, TimeUnit.SECONDS),
+                                            acquired -> {
                                                 if (!acquired) {
-                                                    return Mono.error(new RuntimeException("No available drivers for this slot lock"));
+                                                    return Mono.error(new IllegalStateException("Lock not acquired"));
                                                 }
-                                                // Update availability & fetch updated schedule
-                                                log.info(" Lock ACQUIRED for driver: {} on date: {}", schedule.getDeliveryDriverId(), schedule.getScheduleDate());
-
                                                 return driverScheduleRepository.updateAvailability(schedule.getId(), false)
-                                                        .filter(rowsUpdated -> rowsUpdated > 0)
+                                                        .filter(rows -> rows > 0)
+                                                        .switchIfEmpty(Mono.error(new OptimisticLockingFailureException("Schedule update failed")))
                                                         .flatMap(rows -> driverScheduleRepository.findById(schedule.getId()))
-                                                        .switchIfEmpty(Mono.error(new RuntimeException("Failed to update driver availability")));
-                                            })
-                                            .flatMap(updatedSchedule -> {
-                                                booking.setDeliveryDriverId(updatedSchedule.getDeliveryDriverId());
-                                                return bookingRepository.save(booking)
-                                                        .doFinally(signal -> lock.unlock().subscribe());
-                                            });
-                                }))
-                        .switchIfEmpty(Mono.error(new RuntimeException("No available drivers for this slot"))))
-                .publishOn(Schedulers.fromExecutor(virtualThreadExecutor));
+                                                        .flatMap(updatedSchedule -> {
+                                                            booking.setDeliveryDriverId(updatedSchedule.getDeliveryDriverId());
+                                                            return bookingRepository.save(booking);
+                                                        });
+                                            },
+                                            lock -> lock.unlock(),
+                                            (lock, ex) -> lock.unlock(),
+                                            lock -> lock.unlock()
+                                    );
+                                })
+                        )
+                )
+        )
+        .repeatWhenEmpty(repeat -> repeat.delayElements(Duration.ofMillis(100)))
+        .next(); // Return the first processed booking (subsequent ones are processed but not returned)
     }
 
     @Override
+    @CacheEvict(value = "bookings", key = "#statusUpdateDTO.bookingId")
     public Mono<DeliveryBooking> updateBookingStatus(DeliveryStatusUpdateDTO statusUpdateDTO) {
         return bookingRepository.findById(statusUpdateDTO.getBookingId())
                 .switchIfEmpty(Mono.error(new RuntimeException(" Booking not found")))
@@ -128,12 +143,17 @@ public class DeliveryBookingServiceImpl implements DeliveryBookingService {
                     );
 
                     // Send Kafka Event (Non-Blocking)
-                    return Mono.fromFuture(() -> kafkaProducerService.sendStatusUpdate(event))
-                            .thenReturn(updatedBooking); // Return updated booking after Kafka event is sent
+                    return Mono.fromFuture(kafkaProducerService.sendStatusUpdate(event))
+                            .subscribeOn(Schedulers.boundedElastic())
+                            .thenReturn(updatedBooking);
                 })
                 .doOnSuccess(updatedBooking -> log.info("Booking status updated and Kafka event sent: {}", updatedBooking))
                 .doOnError(error -> log.error(" Error updating booking status", error));
     }
 
-
+    // Optional shutdown hook if any other resources need cleanup
+    @PreDestroy
+    public void shutdown() {
+        // No executor to shut down currently
+    }
 }
