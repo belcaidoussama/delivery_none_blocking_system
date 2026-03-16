@@ -3,6 +3,7 @@ package com.system.delivery.service.Impl;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import jakarta.annotation.PreDestroy;
 
 import com.system.delivery.producer.DeliveryStatusProducerService;
 import com.system.delivery.schema.DeliveryStatusUpdate;
@@ -52,6 +53,11 @@ public class DeliveryBookingServiceImpl implements DeliveryBookingService {
                 .flatMap(tick -> processBookingQueue())
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe();
+    }
+
+    @PreDestroy
+    private void shutdownExecutor() {
+        // No executor to shutdown
     }
 
     @Override
